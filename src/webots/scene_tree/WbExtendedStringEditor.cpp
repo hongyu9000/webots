@@ -1,10 +1,10 @@
-// Copyright 1996-2020 Cyberbotics Ltd.
+// Copyright 1996-2024 Cyberbotics Ltd.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     https://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,17 +14,20 @@
 
 #include "WbExtendedStringEditor.hpp"
 
+#include "WbCadShape.hpp"
 #include "WbControllerPlugin.hpp"
 #include "WbField.hpp"
 #include "WbFieldLineEdit.hpp"
 #include "WbFileUtil.hpp"
 #include "WbFluid.hpp"
 #include "WbLanguage.hpp"
+#include "WbMesh.hpp"
 #include "WbMessageBox.hpp"
 #include "WbNodeUtilities.hpp"
 #include "WbProject.hpp"
-#include "WbProtoList.hpp"
+#include "WbProtoManager.hpp"
 #include "WbProtoModel.hpp"
+#include "WbSkin.hpp"
 #include "WbSolid.hpp"
 #include "WbSolidReference.hpp"
 #include "WbStandardPaths.hpp"
@@ -68,9 +71,9 @@ const QStringList WbExtendedStringEditor::ITEM_LIST_INFO[N_STRING_TYPE_INFO] = {
   QStringList()
     << "plugins/remote_controls/" << tr("Remote control plugins choice")
     << tr("Please select a remote control plugin from the list\n(takes effect only after you save and reload the world)"),
-  QStringList()
-    << "plugins/robot_windows/" << tr("Robot window plugins choice")
-    << tr("Please select a robot window plugin from the list\n(takes effect only after you save and reload the world)"),
+  QStringList() << "plugins/robot_windows/" << tr("Robot window plugins choice")
+                << tr("Please select a robot window plugin from the list\n(takes effect only after you reset the "
+                      "simulation\nand show the new robot window)"),
   QStringList() << "" << tr("Solid choice") << tr("Please select a solid from the list\n")};
 
 const QStringList WbExtendedStringEditor::REFERENCE_AREA_ITEMS = QStringList() << "immersed area"
@@ -112,8 +115,9 @@ const QStringList &WbExtendedStringEditor::defaultControllersEntryList() const {
     QDir defaultDir(WbStandardPaths::projectsPath() + "default/controllers");
     QDir resourcesDir(WbStandardPaths::resourcesControllersPath());
     mDefaultControllersEntryList << defaultDir.entryList(FILTERS) << resourcesDir.entryList(FILTERS);
-    if (WbProject::extraDefaultProject())
-      mDefaultControllersEntryList << QDir(WbProject::extraDefaultProject()->controllersPath()).entryList(FILTERS);
+    foreach (const WbProject *extraProject, *WbProject::extraProjects())
+      mDefaultControllersEntryList << QDir(extraProject->controllersPath()).entryList(FILTERS);
+    mDefaultControllersEntryList.replaceInStrings("generic", "<generic>");
     firstCall = false;
   }
   return mDefaultControllersEntryList;
@@ -126,8 +130,8 @@ const QStringList &WbExtendedStringEditor::defaultPhysicsPluginsEntryList() cons
     QDir defaultDir(WbStandardPaths::projectsPath() + "default/plugins/physics");
     QDir resourcesDir(WbStandardPaths::resourcesPhysicsPluginsPath());
     mDefaultPhysicsPluginsEntryList << defaultDir.entryList(FILTERS) << resourcesDir.entryList(FILTERS);
-    if (WbProject::extraDefaultProject())
-      mDefaultPhysicsPluginsEntryList << QDir(WbProject::extraDefaultProject()->physicsPluginsPath()).entryList(FILTERS);
+    foreach (const WbProject *extraProject, *WbProject::extraProjects())
+      mDefaultPhysicsPluginsEntryList << QDir(extraProject->physicsPluginsPath()).entryList(FILTERS);
     firstCall = false;
   }
   return mDefaultPhysicsPluginsEntryList;
@@ -140,7 +144,7 @@ const QStringList &WbExtendedStringEditor::defaultRobotWindowsPluginsEntryList()
     foreach (const QString &item, list) {
       QFileInfo fi(item);
       QString name = fi.dir().dirName();
-      mDefaultRobotWindowPluginsEntryList << name;
+      mDefaultRobotWindowPluginsEntryList << ((name != "generic") ? name : "<generic>");
     }
     firstCall = false;
   }
@@ -190,7 +194,7 @@ void WbExtendedStringEditor::editInTextEditor() {
 
   // Filters
   QStringList filterNames = WbLanguage::sourceFileExtensions();
-  filterNames.replaceInStrings(QRegExp("^"), stringValue());  // prepend controller name to each item
+  filterNames.replaceInStrings(QRegularExpression("^"), stringValue());  // prepend controller name to each item
 
   QStringList matchingSourceFiles;
   // Searches into the current projects plugins directory or controllers directory
@@ -210,9 +214,9 @@ void WbExtendedStringEditor::editInTextEditor() {
 
   // Searches into the controllers/plugins associated with selected proto instance
   if (dirLocation == noFile && node()->isProtoInstance()) {
-    WbProtoModel *proto = node()->proto();
-    if (!proto->path().isEmpty()) {
-      QDir protoDir(proto->path() + "../" + ITEM_LIST_INFO[mStringType].at(0) + stringValue());
+    const WbProtoModel *proto = node()->proto();
+    if (!proto->projectPath().isEmpty()) {
+      QDir protoDir(proto->projectPath() + "/" + ITEM_LIST_INFO[mStringType].at(0) + stringValue());
       if (protoDir.exists()) {
         dirLocation = protoFile;
         matchingSourceFiles = protoDir.entryList(filterNames, QDir::Files);
@@ -227,7 +231,7 @@ void WbExtendedStringEditor::editInTextEditor() {
   // Searches into the protos/../plugins of all the loaded protos
   // needed to load physics plugins
   if (dirLocation == noFile && isWorldInfoPluginType(mStringType)) {
-    foreach (WbProtoModel *model, WbProtoList::current()->models()) {
+    foreach (const WbProtoModel *model, WbProtoManager::instance()->models()) {
       QDir protoDir(model->path() + "../" + ITEM_LIST_INFO[mStringType].at(0) + stringValue());
       if (protoDir.exists()) {
         dirLocation = externalProtoFile;
@@ -240,16 +244,21 @@ void WbExtendedStringEditor::editInTextEditor() {
     }
   }
 
+  // Define extraDirPath here in case we find it in an extra project directory
+  QString extraDirPath;
   // Look into the extra default project directory
-  if (dirLocation == noFile && WbProject::extraDefaultProject()) {
-    const QString &projectDirPath = WbProject::extraDefaultProject()->path() + fileType + stringValue();
-    QDir projectDir(projectDirPath);
-    if (projectDir.exists()) {
-      dirLocation = extraProjectFile;
-      matchingSourceFiles = projectDir.entryList(filterNames, QDir::Files);
-      if (!matchingSourceFiles.isEmpty()) {
-        emit editRequested(projectDirPath + "/" + matchingSourceFiles[0]);
-        return;
+  if (dirLocation == noFile && !WbProject::extraProjects()->isEmpty()) {
+    foreach (const WbProject *extraProject, *WbProject::extraProjects()) {
+      const QString &projectDirPath = extraProject->path() + fileType + stringValue();
+      QDir projectDir(projectDirPath);
+      if (projectDir.exists()) {
+        dirLocation = extraProjectFile;
+        matchingSourceFiles = projectDir.entryList(filterNames, QDir::Files);
+        if (!matchingSourceFiles.isEmpty()) {
+          extraDirPath = projectDirPath + "/" + matchingSourceFiles[0];
+          emit editRequested(extraDirPath);
+          return;
+        }
       }
     }
   }
@@ -303,7 +312,7 @@ void WbExtendedStringEditor::editInTextEditor() {
       dirPath = WbProject::current()->path();
       break;
     case extraProjectFile:
-      dirPath = WbProject::extraDefaultProject()->path();
+      dirPath = extraDirPath;
       break;
     case protoFile:
       dirPath = node()->proto()->path() + "../";
@@ -322,7 +331,7 @@ void WbExtendedStringEditor::editInTextEditor() {
 
   dirPath += fileType + stringValue();
   QStringList files = QFileDialog::getOpenFileNames(this, ITEM_LIST_INFO[mStringType].at(1), dirPath);
-  foreach (QString fileName, files)
+  foreach (const QString &fileName, files)
     emit editRequested(fileName);
 }
 
@@ -351,7 +360,7 @@ void WbExtendedStringEditor::select() {
   // needed only for physics plugins
   // add protos/../plugins
   if (isWorldInfoPluginType(mStringType)) {
-    foreach (WbProtoModel *model, WbProtoList::current()->models()) {
+    foreach (const WbProtoModel *model, WbProtoManager::instance()->models()) {
       if (!model->path().isEmpty()) {
         QDir dir(model->path() + "../" + ITEM_LIST_INFO[mStringType].at(0));
         items += dir.entryList(FILTERS);
@@ -362,10 +371,12 @@ void WbExtendedStringEditor::select() {
   // add webots resources and default controllers/plugins
   items += defaultEntryList();
   items.sort();
-  if (mStringType == CONTROLLER) {
-    items.prepend("none");
+
+  if (mStringType == CONTROLLER)
     items.prepend("<extern>");
-  }
+  if (mStringType == CONTROLLER || mStringType == ROBOT_WINDOW_PLUGIN || mStringType == PHYSICS_PLUGIN)
+    items.prepend("<none>");
+
   items.removeDuplicates();
 
   // let the user choose from an item list
@@ -377,16 +388,12 @@ void WbExtendedStringEditor::select() {
   int result = dialog.exec();
   if (result == QDialog::Rejected)
     return;
-
-  QString choice = dialog.textValue();
-  if (choice == "none")
-    choice = "";
-
-  lineEdit()->setText(choice);
+  lineEdit()->setText(dialog.textValue());
   apply();
 }
 
-WbExtendedStringEditor::StringType WbExtendedStringEditor::fieldNameToStringType(const QString &fieldName) {
+WbExtendedStringEditor::StringType WbExtendedStringEditor::fieldNameToStringType(const QString &fieldName,
+                                                                                 const WbNode *parentNode) {
   if (fieldName == "controller")
     return CONTROLLER;
   else if (fieldName == "window")
@@ -399,9 +406,18 @@ WbExtendedStringEditor::StringType WbExtendedStringEditor::fieldNameToStringType
     return SOUND;
   else if (fieldName.endsWith("IrradianceUrl", Qt::CaseSensitive))
     return HDR_TEXTURE_URL;
-  else if (fieldName == "url" || fieldName.endsWith("Url", Qt::CaseSensitive))
+  else if (fieldName.endsWith("url", Qt::CaseSensitive) || fieldName.endsWith("Url", Qt::CaseSensitive)) {
+    const WbMesh *mesh = dynamic_cast<const WbMesh *>(parentNode);
+    if (mesh)
+      return MESH_URL;
+    const WbSkin *skin = dynamic_cast<const WbSkin *>(parentNode);
+    if (skin)
+      return SKIN_URL;
+    const WbCadShape *cadShape = dynamic_cast<const WbCadShape *>(parentNode);
+    if (cadShape)
+      return CAD_URL;
     return TEXTURE_URL;
-  else if (fieldName == "solidName")
+  } else if (fieldName == "solidName")
     return SOLID_REFERENCE;
   else if (fieldName == "fluidName")
     return FLUID_NAME;
@@ -415,19 +431,20 @@ void WbExtendedStringEditor::updateWidgets() {
   const bool protoParameter = field()->isParameter();
   const bool regular = mStringType == REGULAR;
   const bool sound = mStringType == SOUND;
-  const bool texture = mStringType == TEXTURE_URL;
+  const bool texture = mStringType == TEXTURE_URL || mStringType == HDR_TEXTURE_URL;
   const bool solidReference = mStringType == SOLID_REFERENCE;
   const bool fluidName = mStringType == FLUID_NAME;
   const bool referenceArea = mStringType == REFERENCE_AREA;
-  const bool enableLineEdit = regular || sound || texture || (solidReference && protoParameter) ||
+  const bool mesh = mStringType == MESH_URL || mStringType == SKIN_URL || mStringType == CAD_URL;
+  const bool enableLineEdit = regular || mesh || sound || texture || (solidReference && protoParameter) ||
                               (fluidName && protoParameter) || (referenceArea && protoParameter);
-  const bool showSelectButton = sound || texture || !regular || (solidReference && !protoParameter) ||
+  const bool showSelectButton = mesh || sound || texture || !regular || (solidReference && !protoParameter) ||
                                 (fluidName && !protoParameter) || (referenceArea && !protoParameter);
-  const bool showEditButton = !regular && !sound && !texture && !solidReference && !fluidName && !referenceArea;
+  const bool showEditButton = !regular && !mesh && !sound && !texture && !solidReference && !fluidName && !referenceArea;
 
   // show/hide widgets
   lineEdit()->setReadOnly(!enableLineEdit);
-  mSelectButton->setVisible(showSelectButton);
+  mSelectButton->setVisible(!field()->hasRestrictedValues() && showSelectButton);
   mEditButton->setVisible(showEditButton);
 }
 
@@ -435,16 +452,12 @@ void WbExtendedStringEditor::edit(bool copyOriginalValue) {
   WbStringEditor::edit(copyOriginalValue);
 
   if (copyOriginalValue) {
-    WbField *effectiveField = field();
-    if (effectiveField->isParameter())
+    const WbField *effectiveField = field();
+    if (!effectiveField->internalFields().isEmpty())
       effectiveField = effectiveField->internalFields().at(0);
 
-    mStringType = fieldNameToStringType(effectiveField->name());
+    mStringType = fieldNameToStringType(effectiveField->name(), effectiveField->parentNode());
   }
-
-  const bool hasRetrictedValues = field()->hasRestrictedValues();
-  mEditButton->setVisible(!hasRetrictedValues);
-  mSelectButton->setVisible(!hasRetrictedValues);
 
   updateWidgets();
 }
@@ -457,53 +470,25 @@ void WbExtendedStringEditor::resetFocus() {
 }
 
 void WbExtendedStringEditor::selectFile(const QString &folder, const QString &title, const QString &types) {
-  QString path;
+  QString path = WbProject::current()->worldsPath();
+  const QDir worldPath(path);
 
   if (!stringValue().isEmpty()) {
-    const QString &str = makeAbsoluteTexturePath(stringValue());
-    QDir dir(QDir::cleanPath(str));
-    dir.cdUp();
-    path = dir.absolutePath();
+    QDir dir(QDir::cleanPath(worldPath.absoluteFilePath(stringValue())));
+    if (dir.cdUp())
+      path = dir.absolutePath();
   } else {
-    // default textures folder
-    const QString &worldsDirPath = WbProject::defaultProject()->worldsPath();
-    const QDir worldsDir(worldsDirPath);
-
-    path = worldsDirPath;
-    if (worldsDir.exists(folder) && QDir(worldsDirPath + folder + '/').exists())
+    if (worldPath.exists(folder))
       path += folder + '/';
   }
 
-  QString fileName = QFileDialog::getOpenFileName(this, tr("Open %1").arg(title), path, tr("%1 files (%2)").arg(title, types));
+  const QString fileName =
+    QFileDialog::getOpenFileName(this, tr("Open %1").arg(title), path, tr("%1 files (%2)").arg(title, types));
   if (fileName.isEmpty())
     return;
 
-  lineEdit()->setText(makeRelativeTexturePath(fileName));
+  lineEdit()->setText(worldPath.relativeFilePath(fileName));
   apply();
-}
-
-QString WbExtendedStringEditor::makeRelativeTexturePath(const QString &fileName) const {
-  foreach (QString path, WbUrl::orderedSearchPaths(node()))
-    if (WbFileUtil::isLocatedInDirectory(fileName, path))
-      // make filename relative to directory where it was located
-      return QDir(path).relativeFilePath(fileName);
-
-  // directory not found: use absoluted filename
-  return fileName;
-}
-
-QString WbExtendedStringEditor::makeAbsoluteTexturePath(const QString &fileName) const {
-  // already absolute
-  if (QDir::isAbsolutePath(fileName))
-    return fileName;
-
-  foreach (QString path, WbUrl::orderedSearchPaths(node())) {
-    QDir dir(path);
-    if (dir.exists(fileName))
-      return dir.absoluteFilePath(fileName);
-  }
-
-  return "";
 }
 
 bool WbExtendedStringEditor::populateItems(QStringList &items) {
@@ -512,7 +497,7 @@ bool WbExtendedStringEditor::populateItems(QStringList &items) {
       const WbNode *const np = field()->parentNode();
       assert(np);
       const WbSolid *const upperSolid = WbNodeUtilities::findUpperSolid(np);
-      WbSolid *const topSolid = upperSolid->topSolid();
+      const WbSolid *const topSolid = upperSolid->topSolid();
       items << WbSolidReference::STATIC_ENVIRONMENT;
       topSolid->collectSolidDescendantNames(items, upperSolid);
       break;
@@ -540,6 +525,15 @@ bool WbExtendedStringEditor::populateItems(QStringList &items) {
     case HDR_TEXTURE_URL:
       selectFile("textures", "Texture", "*.hdr *.HDR");
       break;
+    case MESH_URL:
+      selectFile("meshes", "Meshes", "*.dae *.DAE *.stl *.STL *.obj *.OBJ");
+      break;
+    case SKIN_URL:
+      selectFile("meshes", "Meshes", "*.fbx *.FBX");
+      break;
+    case CAD_URL:
+      selectFile("meshes", "Meshes", "*.dae *.DAE *.obj *.OBJ");
+      break;
     default:
       return false;
   }
@@ -563,18 +557,13 @@ bool WbExtendedStringEditor::selectItem() {
   dialog.setOption(QInputDialog::UseListViewForComboBoxItems, true);
   if (dialog.exec() == QDialog::Rejected)
     return true;
-
-  QString choice = dialog.textValue();
-  if (choice == "none")
-    choice = "";
-
-  lineEdit()->setText(choice);
+  lineEdit()->setText(dialog.textValue());
   apply();
 
   return true;
 }
 
-bool WbExtendedStringEditor::isWorldInfoPluginType(StringType type) {
+bool WbExtendedStringEditor::isWorldInfoPluginType(StringType type) const {
   switch (type) {
     case PHYSICS_PLUGIN:
       return true;
