@@ -4,13 +4,15 @@
 % Description:
 % Author:
 % Modifications:
+function template
 
 % uncomment the next two lines if you want to use
 % MATLAB's desktop to interact with the controller:
 %desktop;
 %keyboard;
 
-TIME_STEP = 64;
+% get the time step of the current world
+TIME_STEP = wb_robot_get_basic_time_step();
 
 % get and enable devices, e.g.:
 %  camera = wb_robot_get_device('camera');

@@ -2,39 +2,57 @@
 
 % useful env variables supplied by webots
 WEBOTS_HOME = getenv('WEBOTS_HOME');
+if ismac
+  WEBOTS_HOME_PATH = [ WEBOTS_HOME '/Contents' ];
+else
+  WEBOTS_HOME_PATH = WEBOTS_HOME;
+end
 WEBOTS_CONTROLLER_NAME = getenv('WEBOTS_CONTROLLER_NAME');
+WEBOTS_CONTROLLER_ARGS = getenv('WEBOTS_CONTROLLER_ARGS');
 WEBOTS_VERSION = getenv('WEBOTS_VERSION');
 
 if isempty(WEBOTS_CONTROLLER_NAME)
   disp('Entering test mode (normally launcher.m should be called by Webots, not from the MATLAB command line)');
   disp(['Using MATLAB R' version('-release')]);
-  cd('../../..');
-  WEBOTS_HOME = pwd;
+  if isempty(WEBOTS_HOME)
+    cd('../../..');
+    WEBOTS_HOME_PATH = pwd;
+  else
+    cd(WEBOTS_HOME_PATH)
+  end
   [status, cmdout] = system('msys64/mingw64/bin/webots.exe --version');
-  WEBOTS_VERSION = strrep(cmdout(17:end-1),'.','_');
-  cd('lib/controller/matlab');
-  disp(['Using Webots ' strrep(WEBOTS_VERSION,'_','.') ' from ' pwd ])
+  k = strfind(cmdout, ' Nightly Build ');
+  if isempty(k)
+    WEBOTS_VERSION = strrep(cmdout(17:end-1),'.','_');
+  else
+    WEBOTS_VERSION = strrep(cmdout(17:k(1)-1),'.','_');
+  end
+  disp(['Using Webots ' strrep(WEBOTS_VERSION,'_','.') ' from ' pwd ]);
   test_mode = true;
 else
   test_mode = false;
 end
 
 % add path to Webots API m-files
-addpath([WEBOTS_HOME '/lib/controller/matlab']);
+addpath([WEBOTS_HOME_PATH '/lib/controller/matlab']);
 
 if ispc
   setenv('MINGWROOT', strcat(WEBOTS_HOME,'\\msys64\\mingw64'));
   libname = 'Controller';
-  installed_addons = matlab.addons.installedAddons;
-  installed = sum(installed_addons.Identifier == "ML_MINGW");
-  if installed <= 0 || matlab.addons.isAddonEnabled("ML_MINGW") <= 0
-    disp('The MATLAB "MinGW-w64 C/C++ Compiler" addon is not installed, please install it from: https://fr.mathworks.com/matlabcentral/fileexchange/52848-matlab-support-for-mingw-w64-c-c-compiler');
+  % in MATLAB 2017b, the following tests are crashing MATLAB
+  % in MATLAB 2019b, the MingGW-w64 C/C++ Compiler is not needed any more
+  if version('-release') == '2018b'
+    installed_addons = matlab.addons.installedAddons;
+    installed = sum(installed_addons.Identifier == "ML_MINGW");
+    if installed <= 0 || matlab.addons.isAddonEnabled("ML_MINGW") <= 0
+      disp('The MATLAB "MinGW-w64 C/C++ Compiler" addon is not installed, please install it from: https://fr.mathworks.com/matlabcentral/fileexchange/52848-matlab-support-for-mingw-w64-c-c-compiler');
+    end
   end
   addpath([WEBOTS_HOME '/msys64/mingw64/bin']);
 else
   libname = 'libController';
   % add path to libController
-  addpath([WEBOTS_HOME '/lib/controller']);
+  addpath([WEBOTS_HOME_PATH '/lib/controller']);
 end
 
 try
@@ -50,11 +68,11 @@ try
   lockfile = 'webots_matlab_lock';
   counter = 1;
   while exist(lockfile, 'file')
-    if (counter == 1)
+    if counter == 1
       disp(['Waiting up to 5 seconds for ' tempdir lockfile ' to be deleted by another MATLAB instance.']);
     end
     pause(1);
-    if (counter == 5)
+    if counter == 5
       disp(['Deleting ' tempdir lockfile '...'])
       delete(lockfile);
     end
@@ -76,13 +94,13 @@ try
         'mfilename',protofile, ...
         'alias','libController', ...
         'addheader','accelerometer.h', ...
+        'addheader','altimeter.h',...
         'addheader','brake.h', ...
         'addheader','camera.h', ...
         'addheader','compass.h', ...
         'addheader','connector.h', ...
         'addheader','console.h', ...
         'addheader','device.h', ...
-        'addheader','differential_wheels.h', ...
         'addheader','display.h', ...
         'addheader','distance_sensor.h', ...
         'addheader','emitter.h', ...
@@ -106,18 +124,19 @@ try
         'addheader','speaker.h', ...
         'addheader','supervisor.h', ...
         'addheader','touch_sensor.h', ...
+        'addheader','vacuum_gripper.h', ...
         'addheader',['utils' filesep 'motion.h'], ...
         'addheader',['utils' filesep 'system.h']);
       disp('Load Library successful');
       libcontrollerloaded = true;
     catch ME % this happens with MATLAB R2015a only but seems to be harmless
-      if (version('-release') == '2015a')
+      if version('-release') == '2015a'
         loadlibrary(libname,protofile,'alias','libController');
         libcontrollerloaded = true;
       else
         disp('Load Library failed.');
-        rethrow(ME);
         loadlibrary = false;
+        rethrow(ME);
       end
     end
     delete(lockfile);
@@ -129,7 +148,7 @@ try
 
   if test_mode == true
     unloadlibrary('libController');
-    cd([WEBOTS_HOME '/lib/controller/matlab']);
+    cd([WEBOTS_HOME_PATH '/lib/controller/matlab']);
     disp('Test successful.');
     return
   end
@@ -146,7 +165,29 @@ try
   WEBOTS_PROJECT = wbu_system_short_path(WEBOTS_PROJECT_UTF8);
 
   cd([WEBOTS_PROJECT '/controllers/' WEBOTS_CONTROLLER_NAME]);
-  eval(WEBOTS_CONTROLLER_NAME);
+
+  % get controller args and wrap as character vectors for eval
+  % also escape the char terminator "'" inside in an argument
+  args = '';
+  if ~isempty(WEBOTS_CONTROLLER_ARGS)
+      if ispc, envsep = ';'; else, envsep = ':'; end
+      split_args = split(WEBOTS_CONTROLLER_ARGS, envsep);
+      for i=1:length(split_args)
+          args = [args,' ''', strrep(split_args{i},'''',''''''), ''''];
+      end
+  end
+
+  % sanitize controller name if needed
+  if ~isvarname(WEBOTS_CONTROLLER_NAME)
+    newname = matlab.lang.makeValidName(WEBOTS_CONTROLLER_NAME);
+    copyfile(append(WEBOTS_CONTROLLER_NAME, '.m'), append(newname, '.m'), 'f');
+    if desktop('-inuse'), dbstop('in', newname); end
+    eval([newname, args]);
+    delete(append(newname, '.m')); % delete temporary file
+  else
+    if desktop('-inuse'), dbstop('in', WEBOTS_CONTROLLER_NAME); end
+    eval([WEBOTS_CONTROLLER_NAME, args]);
+  end
 
 catch ME
   % display error message in Webots console
@@ -156,7 +197,7 @@ catch ME
   if ispc
     if libcontrollerloaded
       % only try to put the error on the console if the library has been loaded
-      calllib('libController', 'wb_console_print', err, 1);
+      calllib('libController', 'wb_console_print', err, 2);
       exit(-1);
     end
     % on Windows, exiting systematically would imply to lose the error message
